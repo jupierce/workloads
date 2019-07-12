@@ -42,41 +42,35 @@
         src: "{{pbench_ssh_public_key_file}}"
       register: pbench_ssh_public_key_file_slurp
 
-    - name: Remove nodevertical label from nodes
-      shell: |
-        oc label nodes -l nodevertical=true nodevertical-
+    - name: nodevertical labeling
+      openshift_client_python:
+        script: |
+          nvc = {{nodevertical_node_count|int}}
+          remaining_count = nvc
+          if {{enable_pbench_agents|bool}}:
+              # Remove nodevertical label on any node
+              oc.selector('nodes').label({'nodevertical': None})
+              # Label up to the first 2 pbench nodes
+              label_pbench_count = min(2, nvc)
+              # Build selector for all agent nodes
+              pbench_nodes_sel = oc.selector('nodes', labels={'pbench_agent': 'true', 'node-role.kubernetes.io/worker': ''})
+              # Select up the first two and label them
+              pbench_nodes_sel.subset(0, label_pbench_count).label({'nodevertical': 'true'})
+              # Store how many more we need
+              remaining_count -= label_pbench_count
 
-    - name: nodevertical node labeling with pbench agents
-      when: enable_pbench_agents|bool
-      block:
-        - name: Label worker nodes with pbench agent for nodevertical (NODEVERTICAL_NODE_COUNT < 2)
-          shell: |
-            oc get nodes -l pbench_agent=true,node-role.kubernetes.io/worker= --no-headers | head -n {{nodevertical_node_count}} | awk '{print $1}' | xargs -I % oc label nodes % nodevertical=true
-          when: nodevertical_node_count|int <= 2
-
-        - name: Label worker nodes with pbench agent for nodevertical (NODEVERTICAL_NODE_COUNT > 2)
-          shell: |
-            oc get nodes -l pbench_agent=true,node-role.kubernetes.io/worker= --no-headers | head -n 2 | awk '{print $1}' | xargs -I % oc label nodes % nodevertical=true
-          when: nodevertical_node_count|int > 2
-
-        - name: Label worker nodes without pbench agent for nodevertical (NODEVERTICAL_NODE_COUNT > 2)
-          shell: |
-            oc get nodes -l node-role.kubernetes.io/worker= --show-labels --no-headers | grep -v "pbench_agent=true" | head -n {{nodevertical_node_count|int -2}} | awk '{print $1}' | xargs -I % oc label nodes % nodevertical=true
-          when: nodevertical_node_count|int > 2
-
-    - name: Label worker nodes when there are no pbench agents
-      shell: |
-        oc get nodes -l node-role.kubernetes.io/worker= --no-headers | head -n {{nodevertical_node_count}} | awk '{print $1}' | xargs -I % oc label nodes % nodevertical=true
-      when: not enable_pbench_agents|bool
+          # Hit desired count by labeling non-agents
+          oc.selector('nodes', labels={'!pbench_agent': 'true', 'node-role.kubernetes.io/worker': ''}).subset(0, remaining_count).label({'nodevertical': 'true'})
 
     - name: Calculate maximum pods to fit in nodevertical labeled space
-      shell: |
-        for node in $(oc get nodes -l="nodevertical=true" | awk 'NR > 1 {print $1}'); do
-          pods_running=$(oc describe node $node | grep -w "Non-terminated \Pods:" | awk '{print $3}' | sed "s/(//g")
-          pod_count=$(( pod_count+pods_running ))
-        done
-        echo "$(( {{nodevertical_maxpods}}-pod_count ))"
-      register: total_pod_count
+      openshift_client_python:
+        script: |
+          total_pod_count = 0
+          for node_apiobj in oc.selector('nodes', labels={'nodeveritical': 'true'}).objects():
+              for pod_apiobj in node_apiobj.related('pods').objects():
+                  if pod_apiobj.model.status.phase in ['Running', 'Pending']:
+                      total_pod_count += 1
+          oc.ansible.new_facts['total_pod_count'] = total_pod_count
 
     - name: Template workload templates
       template:
@@ -102,66 +96,47 @@
       register: scale_ci_tooling_ns_exists
 
     - name: Ensure any stale scale-ci-nodevertical job is deleted
-      shell: |
-        oc delete job scale-ci-nodevertical -n scale-ci-tooling
-      register: scale_ci_tooling_project
-      failed_when: scale_ci_tooling_project.rc == 0
-      until: scale_ci_tooling_project.rc == 1
-      retries: 60
-      delay: 1
-      when: scale_ci_tooling_ns_exists.rc == 0
+      openshift_client_python:
+        script: |
+          with oc.new_project('scale-ci-tooling', ok_if_exists=True):
+              if oc.selector('sa/useroot').count_existing() == 0:
+                oc.invoke('create', cmd_args=['serviceaccount', 'useroot'])
+                oc.invoke('adm', cmd_args=['policy', 'add-scc-to-user', 'privileged', '-z=useroot'])
 
-    - name: Block for non-existing tooling namespace
-      block:
-        - name: Create tooling namespace
-          shell: |
-            oc create -f {{ansible_user_dir}}/scale-ci-tooling/scale-ci-tooling-ns.yml
+              oc.selector('job/scale-ci-nodevertical').delete(ignore_not_found=True)
 
-        - name: Create tooling service account
-          shell: |
-            oc create serviceaccount useroot -n scale-ci-tooling
-            oc adm policy add-scc-to-user privileged -z useroot -n scale-ci-tooling
-          when: enable_pbench_agents|bool
-      when: scale_ci_tooling_ns_exists.rc != 0
+    - name: Replace resources
+      openshift_client_python:
+        project: scale-ci-tooling
+        timeout: 60
+        script: |
+          files = [
+              "{{ansible_user_dir}}/scale-ci-tooling/kubeconfig-secret.yml",
+              "{{ansible_user_dir}}/scale-ci-tooling/pbench-cm.yml",
+              "{{ansible_user_dir}}/scale-ci-tooling/pbench-ssh-secret.yml",
+              "{{ansible_user_dir}}/scale-ci-tooling/workload-nodevertical-script-cm.yml",
+              "{{ansible_user_dir}}/scale-ci-tooling/workload-nodevertical-env.yml",
+              "{{ansible_user_dir}}/scale-ci-tooling/workload-job.yml",
+          ]
 
-    - name: Create/replace kubeconfig secret
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/kubeconfig-secret.yml"
-
-    - name: Create/replace the pbench configmap
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/pbench-cm.yml"
-
-    - name: Create/replace pbench ssh secret
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/pbench-ssh-secret.yml"
-
-    - name: Create/replace workload script configmap
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/workload-nodevertical-script-cm.yml"
-
-    - name: Create/replace workload script environment configmap
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/workload-nodevertical-env.yml"
-
-    - name: Create/replace workload job to that runs workload script
-      shell: |
-        oc replace --force -n scale-ci-tooling -f "{{ansible_user_dir}}/scale-ci-tooling/workload-job.yml"
+          for filename in files:
+              with open(filename, 'r') as f:
+                  oc.replace(f.read(), force=True)
 
     - name: Poll until job pod is running
-      shell: |
-        oc get pods --selector=job-name=scale-ci-nodevertical -n scale-ci-tooling -o json
-      register: pod_json
-      retries: 60
-      delay: 2
-      until: pod_json.stdout | from_json | json_query('items[0].status.phase==`Running`')
+      openshift_client_python:
+        project: scale-ci-tooling
+        timeout: 120
+        script: |
+          oc.selector('pod', labels={'job': 'scale-ci-nodevertical'}).until_all(1, oc.status.is_pod_running)
 
     - name: Poll until job is complete
-      shell: |
-        oc get job scale-ci-nodevertical -n scale-ci-tooling -o json
-      register: job_json
-      retries: "{{job_completion_poll_attempts}}"
-      delay: 10
-      until: job_json.stdout | from_json | json_query('status.succeeded==`1` || status.failed==`1`')
-      failed_when: job_json.stdout | from_json | json_query('status.succeeded==`1`') == false
-      when: job_completion_poll_attempts|int > 0
+      openshift_client_python:
+        project: scale-ci-tooling
+        timeout: 120
+        script: |
+          oc.selector('job/scale-ci-nodevertical').until_all(1,
+                                                             success_func=lambda job: job.model.status.succeeded == 1,
+                                                             failure_func=lambda job: job.model.status.failed == 1,
+                                                             auto_raise=True
+                                                             )
